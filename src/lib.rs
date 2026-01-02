@@ -8,6 +8,43 @@
 use async_trait::async_trait;
 use interprocess::local_socket::LocalSocketListener;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tracing::{event, Level};
+
+pub mod facts;
+pub use facts::{FactType as Fact, FactType, MultimodalFact, RoboticsAction, Vector3D};
+
+// === Authorization / Identity (PoLP) ===
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum AuthScope {
+    ReadFacts,
+    WriteFacts,
+    WritePolicy,
+    ExternalAPI,
+    RoboticsAction,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentIdentity {
+    pub id: String,
+    pub scopes: Vec<AuthScope>,
+}
+
+pub struct AuthorizationGatekeeper;
+
+impl AuthorizationGatekeeper {
+    pub fn can_access(identity: &AgentIdentity, required: AuthScope) -> Result<(), String> {
+        if identity.scopes.contains(&required) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Permission denied: agent '{}' missing required scope {:?}",
+                identity.id, required
+            ))
+        }
+    }
+}
 
 // Re-export for downstream crates so agents can reopen the DB without declaring a direct
 // dependency on `sled`.
@@ -26,6 +63,9 @@ pub struct Task {
     /// JSON payload for the agent.
     pub input_data: String,
 }
+
+/// A high-level plan produced by the core planner.
+pub type Plan = Vec<Task>;
 
 /// A persistent, structured fact produced by an agent.
 #[derive(Debug, Serialize, Deserialize)]
@@ -60,7 +100,8 @@ pub struct PAGIRule {
 #[async_trait]
 pub trait BaseAgent: Send + Sync {
     /// Asynchronously processes the task input and returns a structured result string.
-    async fn run(&self, task_input: &str) -> String;
+    async fn run(&self, identity: &AgentIdentity, core: Arc<PAGICoreModel>, task_input: &str)
+        -> String;
 }
 
 /// Default IPC channel name (local socket / pipe).
@@ -136,13 +177,46 @@ impl std::fmt::Debug for PAGICoreModel {
 }
 
 impl PAGICoreModel {
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, identity),
+        fields(identity_id = %identity.id, required_scope = ?scope)
+    )]
+    pub fn check_authorization(
+        &self,
+        identity: &AgentIdentity,
+        scope: AuthScope,
+    ) -> Result<(), String> {
+        let res = AuthorizationGatekeeper::can_access(identity, scope.clone());
+
+        if let Err(ref e) = res {
+            event!(
+                Level::WARN,
+                identity_id = %identity.id,
+                required_scope = ?scope,
+                error = %e,
+                "Authorization denied"
+            );
+        }
+
+        res
+    }
+
     fn default_rules() -> Vec<PAGIRule> {
-        vec![PAGIRule {
-            id: "rule_failure_rerun_deep".to_string(),
-            condition_fact_type: "AnalysisResult".to_string(),
-            condition_keyword: "Failure".to_string(),
-            action_directive: "Rerun: Deep Search".to_string(),
-        }]
+        vec![
+            PAGIRule {
+                id: "rule_failure_rerun_deep".to_string(),
+                condition_fact_type: "AnalysisResult".to_string(),
+                condition_keyword: "Failure".to_string(),
+                action_directive: "Rerun: Deep Search".to_string(),
+            },
+            PAGIRule {
+                id: "rule_cyber_alert_triage".to_string(),
+                condition_fact_type: "AnalysisResult".to_string(),
+                condition_keyword: "CYBER_ALERT".to_string(),
+                action_directive: "TASK: CybersecurityAgent, INPUT: Triage alert".to_string(),
+            },
+        ]
     }
 
     /// Constructs the core model and opens/creates the persistent knowledge base.
@@ -173,6 +247,39 @@ impl PAGICoreModel {
         }
     }
 
+    fn parse_llm_plan(&self, raw: &str) -> Result<Vec<Task>, String> {
+        let v: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|e| format!("LLM returned non-JSON plan: {e}. Raw: {raw}"))?;
+        let arr = v
+            .as_array()
+            .ok_or_else(|| "LLM plan must be a JSON array".to_string())?;
+
+        let mut tasks = Vec::new();
+        for item in arr {
+            let agent_type = item
+                .get("agent_type")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "Task missing 'agent_type'".to_string())?;
+
+            let input_val = item
+                .get("input_data")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+
+            let input_data = match input_val {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            };
+
+            tasks.push(Task {
+                agent_type: agent_type.to_string(),
+                input_data,
+            });
+        }
+
+        Ok(tasks)
+    }
+
     /// Applies symbolic rules against observed facts and returns action directives.
     pub fn apply_rules_to_facts(&self, facts: Vec<AgentFact>) -> Vec<String> {
         let mut directives = Vec::new();
@@ -195,7 +302,7 @@ impl PAGICoreModel {
     fn resolve_symbolic_directives(&self) -> Vec<String> {
         // In a fuller implementation, we'd query a narrower window (e.g., since last run), or
         // only facts produced by specific analysis agents. For now, scan all facts.
-        let facts = self.retrieve_facts_by_timestamp(0);
+        let facts = self.retrieve_facts_by_timestamp_unchecked(0);
         self.apply_rules_to_facts(facts)
     }
 
@@ -253,7 +360,30 @@ impl PAGICoreModel {
     }
 
     /// Records a fact into the persistent knowledge base.
-    pub fn record_fact(&self, fact: AgentFact) -> Result<(), sled::Error> {
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, identity, fact),
+        fields(
+            identity_id = %identity.id,
+            agent_id = %fact.agent_id,
+            fact_type = %fact.fact_type,
+            timestamp = fact.timestamp
+        )
+    )]
+    pub fn record_fact(&self, identity: &AgentIdentity, fact: AgentFact) -> Result<(), String> {
+        // Backwards-compatible gating: robotics agents may be granted a narrower scope than
+        // full KB writes.
+        if self
+            .check_authorization(identity, AuthScope::WriteFacts)
+            .is_err()
+        {
+            self.check_authorization(identity, AuthScope::RoboticsAction)?;
+        }
+        self.record_fact_unchecked(fact)
+            .map_err(|e| format!("KB write failed: {e}"))
+    }
+
+    fn record_fact_unchecked(&self, fact: AgentFact) -> Result<(), sled::Error> {
         let tree = self.knowledge_base.open_tree(FACTS_TREE)?;
         let id = self.knowledge_base.generate_id()?;
 
@@ -266,8 +396,27 @@ impl PAGICoreModel {
         Ok(())
     }
 
-    /// Retrieves all facts added since the given unix timestamp (seconds).
-    pub fn retrieve_facts_by_timestamp(&self, start_ts: u64) -> Vec<AgentFact> {
+    /// Retrieves all facts added since the given unix timestamp.
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, identity),
+        fields(identity_id = %identity.id, start_ts)
+    )]
+    pub fn retrieve_facts_by_timestamp(
+        &self,
+        identity: &AgentIdentity,
+        start_ts: u128,
+    ) -> Result<Vec<AgentFact>, String> {
+        self.check_authorization(identity, AuthScope::ReadFacts)?;
+
+        let facts = self.retrieve_facts_by_timestamp_unchecked(start_ts);
+        tracing::event!(Level::DEBUG, facts_len = facts.len(), "KB read completed");
+        Ok(facts)
+    }
+
+    fn retrieve_facts_by_timestamp_unchecked(&self, start_ts: u128) -> Vec<AgentFact> {
+        let start_ts_u64 = u64::try_from(start_ts).unwrap_or(u64::MAX);
+
         let Ok(tree) = self.knowledge_base.open_tree(FACTS_TREE) else {
             return Vec::new();
         };
@@ -278,7 +427,7 @@ impl PAGICoreModel {
                 let key_str = String::from_utf8(k.to_vec()).ok()?;
                 let (ts_str, _) = key_str.split_once('_')?;
                 let ts = ts_str.parse::<u64>().ok()?;
-                if ts < start_ts {
+                if ts < start_ts_u64 {
                     return None;
                 }
 
@@ -290,7 +439,7 @@ impl PAGICoreModel {
     fn latest_reflection_for_agent(&self, target_agent: &str) -> Option<ReflectionFact> {
         // Reflections are stored as AgentFact entries with fact_type == "ReflectionFact" and
         // JSON-encoded ReflectionFact in `content`.
-        let facts = self.retrieve_facts_by_timestamp(0);
+        let facts = self.retrieve_facts_by_timestamp_unchecked(0);
 
         facts
             .into_iter()
@@ -341,8 +490,62 @@ impl PAGICoreModel {
     /// For the example prompt:
     /// "Please research the top anti-aging compounds and schedule a team meeting for next week to present the findings."
     /// this method returns two tasks: one for `SearchAgent` and one for `CalendarAgent`.
-    pub fn general_reasoning(&self, prompt: &str) -> Result<Vec<Task>, String> {
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, prompt, llm_response_json),
+        fields(prompt_len = prompt.len(), llm_response_len = llm_response_json.len())
+    )]
+    pub async fn general_reasoning(
+        &self,
+        prompt: &str,
+        llm_response_json: &str,
+    ) -> Result<Plan, String> {
+        // Always keep the fast-path deterministic for security triage.
+        let lowered = prompt.to_lowercase();
+        if lowered.contains("siem") || lowered.contains("crowdstrike") || lowered.contains("rapid7") {
+            return self.general_reasoning_fallback(prompt);
+        }
+
+        // If the orchestrator didn't/couldn't provide an LLM response, fall back to the
+        // symbolic/rule-based planner.
+        if llm_response_json.trim().is_empty()
+            || std::env::var("PAGI_DISABLE_LLM").ok().as_deref() == Some("1")
+        {
+            return self.general_reasoning_fallback(prompt);
+        }
+
+        // Parse the LLM plan; if parsing fails, fall back.
+        match self.parse_llm_plan(llm_response_json) {
+            Ok(tasks) if !tasks.is_empty() => {
+                // Symbolic integration: apply symbolic directives over LLM output.
+                let directives = self.resolve_symbolic_directives();
+                if directives.is_empty() {
+                    Ok(tasks)
+                } else {
+                    Ok(self.apply_symbolic_directives_to_plan(tasks, &directives))
+                }
+            }
+            Ok(_) => self.general_reasoning_fallback(prompt),
+            Err(_) => self.general_reasoning_fallback(prompt),
+        }
+    }
+
+    fn general_reasoning_fallback(&self, prompt: &str) -> Result<Vec<Task>, String> {
         let normalized = prompt.trim();
+        let lowered = normalized.to_lowercase();
+
+        // Security-first planning path.
+        if lowered.contains("siem") || lowered.contains("crowdstrike") || lowered.contains("rapid7") {
+            return Ok(vec![Task {
+                agent_type: "CybersecurityAgent".to_string(),
+                input_data: serde_json::json!({
+                    "action": "Triage alert",
+                    "source_prompt": normalized,
+                })
+                .to_string(),
+            }]);
+        }
+
         let example_prompt = "Please research the top anti-aging compounds and schedule a team meeting for next week to present the findings.";
 
         if normalized == example_prompt {
@@ -430,15 +633,19 @@ impl PAGICoreModel {
 mod tests {
     use super::*;
 
-    #[test]
-    fn example_prompt_returns_two_tasks() {
+    #[tokio::test]
+    async fn example_prompt_returns_two_tasks() {
         let db = sled::Config::new()
             .temporary(true)
             .open()
             .expect("failed to open temporary sled db");
         let model = PAGICoreModel::from_db(db);
         let prompt = "Please research the top anti-aging compounds and schedule a team meeting for next week to present the findings.";
-        let tasks = model.general_reasoning(prompt).expect("expected Ok plan");
+        let tasks = model
+            // In tests we pass an empty LLM response so the core uses the deterministic fallback.
+            .general_reasoning(prompt, "")
+            .await
+            .expect("expected Ok plan");
 
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].agent_type, "SearchAgent");
